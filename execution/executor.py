@@ -37,8 +37,10 @@ from config import (
     MAX_PENDING_BOT_ORDERS,
     MAX_PENDING_BOT_ORDERS_PER_TICKER,
     MARGIN_ERROR_COOLDOWN_SECS,
+    UNWIND_ESCALATE_AFTER_REFRESHES,
     UNWIND_MIN_PROFIT_CENTS,
     UNWIND_FORCE_IF_FREE_MARGIN_BELOW_CENTS,
+    MAX_ALLOC_FREE_MARGIN_FRAC,
 )
 
 log = logging.getLogger(__name__)
@@ -87,6 +89,9 @@ class Executor:
         self._last_equity_cents: Optional[float] = None
         self._last_free_margin_cents: Optional[float] = None
         self._last_unwind_at: dict[str, float] = {}
+        # Consecutive unwind refreshes per ticker since last flatten.
+        # Used to escalate pricing when reduce-only limits never fill.
+        self._unwind_refresh_count: dict[str, int] = {}
 
     @property
     def pending_order_count(self) -> int:
@@ -254,8 +259,34 @@ class Executor:
                 side,
                 eff_strength,
             )
-            return
             return False
+
+        # Dynamic sizing: cap OPEN risk as a fraction of freeMargin.
+        # This prevents repeated 409 INSUFFICIENT_MARGIN loops when signals fire during low headroom.
+        if not self.dry_run and side in ("buy", "sell"):
+            fm = self._last_free_margin_cents
+            if fm is not None and fm > 0:
+                # Use the intended order price when available, else last mark.
+                est_px = None
+                try:
+                    est_px = int(mpx) if mpx is not None else None
+                except Exception:
+                    est_px = None
+                # We'll refine after we compute the actual limit price below; for now, cap by mark.
+                if est_px is not None and est_px > 0:
+                    max_alloc = float(fm) * float(MAX_ALLOC_FREE_MARGIN_FRAC)
+                    max_qty = int(max_alloc // float(est_px))
+                    if max_qty >= 0:
+                        qty = max(0, min(int(qty), int(max_qty)))
+                        if qty == 0:
+                            log.info(
+                                "%s: skip open — freeMargin cap (free≈$%.2f alloc=%.0f%% px=%.2f)",
+                                ticker,
+                                fm / 100.0,
+                                float(MAX_ALLOC_FREE_MARGIN_FRAC) * 100.0,
+                                est_px / 100.0,
+                            )
+                            return False
 
         # Check if we already hold a position in the same direction
         pos = self.portfolio.positions.get(ticker)
@@ -304,6 +335,23 @@ class Executor:
         if price is None:
             log.warning("%s: skip order — no limit price (orderbook empty and no mark)", ticker)
             return False
+
+        # Re-apply freeMargin cap using the actual order price (more accurate than mark).
+        if not self.dry_run:
+            fm = self._last_free_margin_cents
+            if fm is not None and fm > 0 and price > 0:
+                max_alloc = float(fm) * float(MAX_ALLOC_FREE_MARGIN_FRAC)
+                max_qty = int(max_alloc // float(price))
+                qty = max(0, min(int(qty), int(max_qty)))
+                if qty == 0:
+                    log.info(
+                        "%s: skip open — freeMargin cap (free≈$%.2f alloc=%.0f%% px=%.2f)",
+                        ticker,
+                        fm / 100.0,
+                        float(MAX_ALLOC_FREE_MARGIN_FRAC) * 100.0,
+                        price / 100.0,
+                    )
+                    return False
 
         self._cancel_bot_managed_orders_for_ticker(ticker)
         return self._place(ticker, side, qty, price, price_mode=mode, strategy_label=strategy_label)
@@ -510,6 +558,7 @@ class Executor:
 
         pos = self.portfolio.positions.get(ticker)
         if not pos or pos.qty == 0:
+            self._unwind_refresh_count.pop(ticker, None)
             return
 
         now = time.time()
@@ -587,6 +636,23 @@ class Executor:
                     self._last_unwind_at[ticker] = now
                     return
 
+        # Escalation: if we've refreshed unwind orders repeatedly without flattening,
+        # cross the spread to actually get out and clear unwind lockout.
+        # This is separate from the freeMargin-based "force" path.
+        refresh_count = int(self._unwind_refresh_count.get(ticker, 0))
+        escalate = (not force) and (int(UNWIND_ESCALATE_AFTER_REFRESHES) > 0) and (refresh_count >= int(UNWIND_ESCALATE_AFTER_REFRESHES))
+
+        # If we're in a true margin squeeze, take liquidity (cross-spread) to free margin now.
+        if force or escalate:
+            try:
+                # "aggressive" crosses (best ask/bid ± buffer) via the shared pricing function.
+                cross_px = self._get_order_price(ticker, side, marks, "aggressive")
+                if cross_px is not None:
+                    px = int(cross_px)
+                    price_mode = "aggressive"
+            except Exception:
+                pass
+
         # Replace only our prior reduce-only orders on that side (avoid stacking).
         self._cancel_bot_managed_orders_for_ticker_side(ticker, side)
         ok = self._place(
@@ -607,6 +673,8 @@ class Executor:
                 px / 100.0,
                 pos.qty,
             )
+            # Only count "attempts" when we actually submit an unwind order.
+            self._unwind_refresh_count[ticker] = refresh_count + 1
         self._last_unwind_at[ticker] = now
 
     def held_for_seconds(self, ticker: str) -> float:

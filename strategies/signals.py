@@ -284,9 +284,9 @@ class IndexMomentum:
 # Strategy weights (must sum to 1.0). Funding-first: perp carry is the cleanest edge.
 WEIGHTS = {
     # Competition mode: favor carry + trend; MR is disabled for entries by default.
-    "FundingHarvest": 0.72,
+    "FundingHarvest": 0.30,
     "MeanReversion":  0.00,
-    "IndexMomentum":  0.28,
+    "IndexMomentum":  0.70,
 }
 
 # |combined_dir| above this → long/short; MR-only often ~0.10–0.14 — higher = quieter.

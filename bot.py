@@ -52,6 +52,8 @@ from config import (
     MARKETS_CACHE_TTL_SEC,
     FUNDING_REFRESH_INTERVAL_SEC,
     ENTRY_OPEN_PRICE_MODE,
+    MAX_NEW_OPENS_PER_LOOP,
+    FUNDING_AGGRESSIVE_ENTRY_SECS_BEFORE,
     MIN_HOLD_SECS,
     MR_EXIT_MIN_PNL_PCT,
     MR_FORCE_EXIT_Z,
@@ -69,6 +71,7 @@ from config import (
     MM_REFRESH_SECS,
     ENABLE_UNWIND_WORKER,
     UNWIND_TICKERS,
+    UNWIND_BLOCK_DIRECTIONAL_OPENS_ON_LIST,
     UNWIND_MAX_QTY_PER_ORDER,
     UNWIND_REFRESH_SECS,
     UNWIND_PRICE_MODE,
@@ -79,7 +82,12 @@ from core.client import ForumClient
 from core.market_enrichment import enrich_market_with_funding, seconds_until_iso
 from core.portfolio import Portfolio
 from strategies.signals import (
-    FundingHarvest, MeanReversion, IndexMomentum, combine_signals, WEIGHTS,
+    FundingHarvest,
+    MeanReversion,
+    IndexMomentum,
+    Signal,
+    combine_signals,
+    WEIGHTS,
 )
 from execution.executor import Executor
 
@@ -391,6 +399,11 @@ class ForumBot:
             and UNWIND_TICKERS
             and any((t in self.portfolio.positions and self.portfolio.positions[t].qty != 0) for t in UNWIND_TICKERS)
         )
+        unwind_list = set(UNWIND_TICKERS)
+        mm_tickers = set(MARKET_MAKING_TICKERS)
+        first_mm = MARKET_MAKING_TICKERS[0] if MARKET_MAKING_TICKERS else None
+        open_candidates: list[tuple[float, str, dict, list[Signal], Signal]] = []
+
         for m in markets:
             ticker = m["ticker"]
             signals = []
@@ -460,6 +473,17 @@ class ForumBot:
             combined = combine_signals(signals)
             if combined:
                 signals_fired += 1
+                if (
+                    combined.direction != 0
+                    and ENABLE_UNWIND_WORKER
+                    and UNWIND_BLOCK_DIRECTIONAL_OPENS_ON_LIST
+                    and ticker in unwind_list
+                ):
+                    log.info(
+                        "%s: skip open — ticker on UNWIND_TICKERS (no new risk until removed from list)",
+                        ticker,
+                    )
+                    continue
                 if unwind_active:
                     log.info("%s: skip open — unwind lockout active (cleaning inventory)", ticker)
                     continue
@@ -469,23 +493,17 @@ class ForumBot:
                         ticker,
                     )
                     continue
-                log.info(combined)
-                funding_urgent = combined.strategy.startswith("Combined") and any(
-                    s.strategy == "FundingHarvest" for s in signals
-                )
-                price_mode = "aggressive" if funding_urgent else ENTRY_OPEN_PRICE_MODE
-                ok = self.executor.execute_signal(
-                    ticker, combined.direction, combined.strength, marks,
-                    price_mode=price_mode,
-                    strategy_label=combined.strategy,
-                )
-                execute_signal_calls += 1
-                if ok:
-                    orders_placed += 1
+                open_candidates.append((combined.edge, ticker, m, signals, combined))
             else:
                 # If directional signals are quiet (common when funding is small), run a
                 # conservative market-making loop on selected, tighter-spread tickers.
-                if ENABLE_MARKET_MAKING and ticker in set(MARKET_MAKING_TICKERS):
+                if ENABLE_MARKET_MAKING and ticker in mm_tickers:
+                    if (
+                        ENABLE_UNWIND_WORKER
+                        and UNWIND_BLOCK_DIRECTIONAL_OPENS_ON_LIST
+                        and ticker in unwind_list
+                    ):
+                        continue
                     # When you have a manual/discretionary position on the book (e.g. ALTMAN),
                     # margin headroom is the binding constraint. In that regime, quote only the
                     # first configured MM ticker to avoid margin conflicts + one-sided exposure.
@@ -493,7 +511,7 @@ class ForumBot:
                         # Always allow quoting tickers where we already have inventory so we can
                         # work back toward flat (reduce-only is enforced inside the executor).
                         have_inv = (ticker in self.portfolio.positions and self.portfolio.positions[ticker].qty != 0)
-                        if not have_inv and ticker != (MARKET_MAKING_TICKERS[0] if MARKET_MAKING_TICKERS else ticker):
+                        if not have_inv and first_mm is not None and ticker != first_mm:
                             continue
                     self.executor.quote_market_make(
                         ticker,
@@ -503,6 +521,35 @@ class ForumBot:
                         max_inventory=int(MM_MAX_INVENTORY),
                         refresh_secs=int(MM_REFRESH_SECS),
                     )
+
+        open_candidates.sort(key=lambda x: -x[0])
+        opens_budget = int(MAX_NEW_OPENS_PER_LOOP)
+        if len(open_candidates) > opens_budget:
+            log.info(
+                "Directional open budget: up to %d execution(s) this tick (%d candidate(s) by edge)",
+                opens_budget,
+                len(open_candidates),
+            )
+        for _edge, ticker, m, signals, combined in open_candidates:
+            if opens_budget <= 0:
+                break
+            log.info(combined)
+            until = seconds_until_iso(m.get("nextFundingTime"))
+            funding_near = (
+                until is not None
+                and 0 < until <= FUNDING_AGGRESSIVE_ENTRY_SECS_BEFORE
+            )
+            funding_urgent = funding_near and any(s.strategy == "FundingHarvest" for s in signals)
+            price_mode = "aggressive" if funding_urgent else ENTRY_OPEN_PRICE_MODE
+            ok = self.executor.execute_signal(
+                ticker, combined.direction, combined.strength, marks,
+                price_mode=price_mode,
+                strategy_label=combined.strategy,
+            )
+            execute_signal_calls += 1
+            if ok:
+                orders_placed += 1
+                opens_budget -= 1
 
         self.executor.record_mark_to_market_scores(marks)
         self.executor.cancel_stale_orders()

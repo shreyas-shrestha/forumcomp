@@ -115,38 +115,64 @@ MARGIN_ERROR_COOLDOWN_SECS = 180
 # on a small subset of tickers with relatively tight spreads (e.g. SPACEX).
 ENABLE_MARKET_MAKING = True
 # Only quote these tickers (empty list => disabled by filter, even if ENABLE_MARKET_MAKING).
-MARKET_MAKING_TICKERS = ["SPACEX", "CLUELY", "PEPTIDES", "OPENAI"]
+MARKET_MAKING_TICKERS = ["SPACEX", "OPENAI"]
 # Only quote when top-of-book spread is at/below this many cents.
 MM_MAX_SPREAD_CENTS = 60
 # Quote size (contracts) per side.
-MM_QUOTE_QTY = 2
+MM_QUOTE_QTY = 1
 # Inventory cap per ticker (absolute position size). If exceeded, only quote to reduce.
-MM_MAX_INVENTORY = 6
+MM_MAX_INVENTORY = 3
 # How often to refresh quotes (seconds). Should be >= loop interval to avoid spam.
 MM_REFRESH_SECS = 60
 
 # ─── POSITION UNWIND (REDUCE-ONLY WORKER) ─────────────────────────────────────
 # When you have a discretionary/manual position, it can consume freeMargin and break MM.
 # This worker slowly works positions down using reduce-only limit orders (no new risk).
-ENABLE_UNWIND_WORKER = True
-# Only unwind these tickers (empty => disabled). Useful for cleaning up manual mistakes.
-# Set this to ALL currently-held tickers when you need to fully reset inventory + free margin.
-# Based on your `forum_bot.log (1–5435)` tail, you had open positions in:
-#   ALTMAN, GTASIX, ICE, KALSHI, KANYE, SPACEX, UBER
-UNWIND_TICKERS = ["ALTMAN", "GTASIX", "ICE", "KALSHI", "KANYE", "SPACEX", "UBER"]
+#
+# **Contest / normal trading:** keep this OFF and UNWIND_TICKERS empty so the bot does not
+# keep flattening names you want to run for funding/momentum/MM.
+# **Emergency cleanup only:** set ENABLE_UNWIND_WORKER = True and list tickers to flatten;
+# when done, turn OFF again and clear the list.
+ENABLE_UNWIND_WORKER = False
+# Only unwind these tickers (empty => worker does nothing even if enabled).
+UNWIND_TICKERS = []
 # Max contracts per reduce-only order.
 UNWIND_MAX_QTY_PER_ORDER = 1
 # How often to refresh unwind orders per ticker.
-UNWIND_REFRESH_SECS = 90
+UNWIND_REFRESH_SECS = 75
 # Price style for unwind:
 # - "passive": join best bid/ask (slow)
 # - "improve": step inside spread when possible (faster, still non-crossing)
-UNWIND_PRICE_MODE = "passive"
+UNWIND_PRICE_MODE = "improve"
+# If unwind orders keep refreshing without flattening, escalate to crossing the spread.
+# This prevents "forever resting" reduce-only orders that keep the bot in unwind lockout.
+UNWIND_ESCALATE_AFTER_REFRESHES = 3
 # Profit guard for unwind: avoid selling longs below avg entry (and avoid buying shorts above avg entry)
 # unless margin is dangerously low.
-UNWIND_MIN_PROFIT_CENTS = 2
+# Start by allowing breakeven-ish unwind so lockout can clear inventory.
+UNWIND_MIN_PROFIT_CENTS = 0
 # If freeMargin (cents) drops below this, unwind is allowed even at a loss to reduce risk.
-UNWIND_FORCE_IF_FREE_MARGIN_BELOW_CENTS = 5_000
+# Raise this so we go aggressive earlier (your logs show freeMargin bouncing around ~$85-$100).
+UNWIND_FORCE_IF_FREE_MARGIN_BELOW_CENTS = 15_000
+# If True, never open new directional (or MM) risk on tickers in UNWIND_TICKERS while the
+# unwind worker is enabled. Prevents FundingHarvest from immediately re-buying names the
+# unwind worker just flattened (ping-pong). Remove a ticker from UNWIND_TICKERS when you
+# want normal trading there again.
+UNWIND_BLOCK_DIRECTIONAL_OPENS_ON_LIST = True
+
+# ─── DYNAMIC SIZING (MARGIN-AWARE) ────────────────────────────────────────────
+# Cap new OPEN order size based on live freeMargin to avoid 409 INSUFFICIENT_MARGIN.
+# Applies to directional opens (funding/momentum). Reduce-only closes are unaffected.
+# Slightly higher than 0.15 so one contract can clear when free margin is only ~$200–400.
+MAX_ALLOC_FREE_MARGIN_FRAC = 0.35
+
+# Max successful new directional orders per main loop (after sorting by combined edge).
+# Stops the “16 cross-spread opens in one tick” pattern that triggers 409 + long cooldowns.
+MAX_NEW_OPENS_PER_LOOP = 5
+
+# Use aggressive (cross-spread) pricing only inside this window before nextFundingTime,
+# and only when a FundingHarvest leg is present. Outside the window, ENTRY_OPEN_PRICE_MODE applies.
+FUNDING_AGGRESSIVE_ENTRY_SECS_BEFORE = 120
 
 # ─── MOMENTUM ─────────────────────────────────────────────────────────────────
 MOM_FAST_BARS       = 6             # fast EWM (3h)
