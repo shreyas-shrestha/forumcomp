@@ -17,7 +17,7 @@ from typing import Dict, List, Optional
 
 import numpy as np
 
-from config import UNIVERSE
+from config import UNIVERSE, ENTRY_OPEN_PRICE_MODE
 from core.client import ForumClient
 from core.market_enrichment import candle_time_key
 from core.portfolio import Portfolio
@@ -139,7 +139,11 @@ def run_backtest(tickers: List[str], resolution_min: int = 30, bars: int = 200):
             combined = combine_signals(sigs)
             if combined:
                 executor.execute_signal(
-                    ticker, combined.direction, combined.strength, marks
+                    ticker,
+                    combined.direction,
+                    combined.strength,
+                    marks,
+                    price_mode=ENTRY_OPEN_PRICE_MODE,
                 )
 
         nav = portfolio.nav(marks)

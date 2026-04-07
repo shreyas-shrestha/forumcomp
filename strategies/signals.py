@@ -22,9 +22,34 @@ from config import (
     MR_ZSCORE_ENTRY, MR_ZSCORE_EXIT, MR_LOOKBACK_BARS,
     MOM_FAST_BARS, MOM_SLOW_BARS, MOM_SIGNAL_THRESH,
     MIN_EDGE_THRESHOLD,
+    MIN_COMBINED_STRENGTH,
+    REQUIRE_MULTI_STRATEGY_CONFIRMATION,
+    SINGLE_STRATEGY_MIN_STRENGTH,
+    ALLOW_SINGLE_STRATEGY_SIGNALS,
+    SINGLE_STRATEGY_ALLOWLIST,
+    SINGLE_STRATEGY_ALLOWLIST_MIN_STRENGTH,
 )
 
 log = logging.getLogger(__name__)
+
+
+def _index_in_price_units(price: Optional[float], index: Optional[float]) -> Optional[float]:
+    """
+    Normalize index units to match trade price units.
+
+    Forum `lastPrice` is typically in cents (e.g. 5053), while `lastIndexValue`
+    is often dollar-like (e.g. 51.17). Mean-reversion needs both on the same
+    scale before computing spread/z-score.
+    """
+    if price is None or index is None:
+        return None
+    # Typical live shape: price in cents, index in dollars.
+    if price >= 1000 and index < 200:
+        return index * 100.0
+    # Defensive fallback for the opposite mismatch.
+    if price < 200 and index > 1000:
+        return index / 100.0
+    return index
 
 
 @dataclass
@@ -102,9 +127,10 @@ class MeanReversion:
 
     def update(self, ticker: str, price: Optional[float],
                index: Optional[float]):
-        if price is None or index is None:
+        idx_px = _index_in_price_units(price, index)
+        if price is None or idx_px is None:
             return
-        spread = price - index
+        spread = price - idx_px
         hist = self._history.setdefault(ticker, [])
         hist.append(spread)
         if len(hist) > MR_LOOKBACK_BARS:
@@ -136,8 +162,12 @@ class MeanReversion:
         direction = -1 if z > 0 else 1
         strength  = min(1.0, (abs(z) - MR_ZSCORE_ENTRY) /
                             (MR_ZSCORE_ENTRY * 2))
-        # Edge approximation: spread/price as fraction
+        # Edge approximation: spread/price as fraction.
         edge = abs(current_spread) / price if price else 0
+        # Safety: absurdly large edge usually means malformed market data.
+        if edge > 0.20:
+            log.debug("%s: skip MR signal — implausible edge %.3f", ticker, edge)
+            return None
 
         if edge < MIN_EDGE_THRESHOLD:
             return None
@@ -161,6 +191,18 @@ class MeanReversion:
             return True
         z = (hist[-1] - mu) / sigma
         return abs(z) < MR_ZSCORE_EXIT
+
+    def current_abs_zscore(self, ticker: str) -> Optional[float]:
+        """Current |z| of spread history for exit gating/logging."""
+        hist = self._history.get(ticker, [])
+        if len(hist) < 5:
+            return None
+        arr = np.array(hist, dtype=float)
+        mu, sigma = arr.mean(), arr.std()
+        if sigma < 1e-6:
+            return 0.0
+        z = (hist[-1] - mu) / sigma
+        return abs(float(z))
 
 
 # ─── 3. Index Momentum ───────────────────────────────────────────────────────
@@ -241,13 +283,14 @@ class IndexMomentum:
 
 # Strategy weights (must sum to 1.0). Funding-first: perp carry is the cleanest edge.
 WEIGHTS = {
-    "FundingHarvest": 0.52,
-    "MeanReversion":  0.33,
-    "IndexMomentum":  0.15,
+    # Competition mode: favor carry + trend; MR is disabled for entries by default.
+    "FundingHarvest": 0.72,
+    "MeanReversion":  0.00,
+    "IndexMomentum":  0.28,
 }
 
-# |combined_dir| above this → long/short; MR-only signals often sit ~0.10–0.14.
-COMBINED_DIRECTION_THRESH = 0.10
+# |combined_dir| above this → long/short; MR-only often ~0.10–0.14 — higher = quieter.
+COMBINED_DIRECTION_THRESH = 0.14
 
 
 def combine_signals(signals: List[Signal]) -> Optional[Signal]:
@@ -279,6 +322,24 @@ def combine_signals(signals: List[Signal]) -> Optional[Signal]:
         log.debug(f"{ticker}: combined edge {avg_edge:.4f} below threshold, skip")
         return None
 
+    # Quality gates to reduce noisy, low-conviction entries.
+    if len(signals) == 1 and REQUIRE_MULTI_STRATEGY_CONFIRMATION:
+        only = signals[0]
+        if not ALLOW_SINGLE_STRATEGY_SIGNALS:
+            if only.strategy in SINGLE_STRATEGY_ALLOWLIST and only.strength >= SINGLE_STRATEGY_ALLOWLIST_MIN_STRENGTH:
+                pass
+            else:
+                log.debug("%s: single-strategy signals disabled (strategy=%s), skip", ticker, only.strategy)
+                return None
+        if only.strength < SINGLE_STRATEGY_MIN_STRENGTH:
+            log.debug(
+                "%s: single-strategy signal too weak (%.2f < %.2f), skip",
+                ticker,
+                only.strength,
+                SINGLE_STRATEGY_MIN_STRENGTH,
+            )
+            return None
+
     t = COMBINED_DIRECTION_THRESH
     if -t <= combined_dir <= t:
         log.debug(
@@ -288,6 +349,14 @@ def combine_signals(signals: List[Signal]) -> Optional[Signal]:
 
     direction = 1 if combined_dir > 0 else -1
     strength  = min(1.0, abs(combined_dir))
+    if strength < MIN_COMBINED_STRENGTH:
+        log.debug(
+            "%s: combined strength %.2f below minimum %.2f, skip",
+            ticker,
+            strength,
+            MIN_COMBINED_STRENGTH,
+        )
+        return None
 
     strats = ", ".join(s.strategy for s in signals)
     return Signal(

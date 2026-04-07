@@ -128,6 +128,60 @@ class Portfolio:
         log.info(f"FILL {side.upper()} {qty}x {ticker} @ {price/100:.2f}  "
                  f"cash={self.cash/100:.2f}")
 
+    def apply_exchange_snapshot(
+        self,
+        position_rows: list,
+        account: Optional[dict],
+        marks: Dict[str, float],
+    ) -> None:
+        """
+        Overwrite open positions from GET /positions and align cash with GET /account equity.
+
+        Sets cash so that nav(marks) matches exchange equity when marks match the exchange
+        mark; between polls, NAV moves with lastPrice like a normal MTM book.
+        """
+        self.positions.clear()
+        for row in position_rows:
+            if not isinstance(row, dict):
+                continue
+            t = row.get("ticker")
+            if not t:
+                continue
+            raw_qty = row.get("qty", 0)
+            try:
+                q = float(raw_qty)
+            except (TypeError, ValueError):
+                continue
+            if abs(q) < 1e-9:
+                continue
+            qty_i = int(round(q))
+            if qty_i == 0:
+                continue
+            try:
+                avg = float(row["avgEntryPrice"])
+            except (KeyError, TypeError, ValueError):
+                continue
+            lcf = row.get("lastCumFunding")
+            try:
+                lcf_f = float(lcf) if lcf is not None else 0.0
+            except (TypeError, ValueError):
+                lcf_f = 0.0
+            self.positions[str(t)] = Position(str(t), qty_i, avg, last_cum_funding=lcf_f)
+
+        if account and isinstance(account, dict):
+            eq = account.get("equity")
+            if eq is not None:
+                try:
+                    equity = float(eq)
+                except (TypeError, ValueError):
+                    equity = None
+                if equity is not None:
+                    local_u = sum(
+                        p.mark_pnl(marks[t] if t in marks else p.avg_price)
+                        for t, p in self.positions.items()
+                    )
+                    self.cash = equity - local_u
+
     def update_funding(self, ticker: str, cum_funding: float):
         """Apply funding PnL and update position's lastCumFunding."""
         if ticker not in self.positions:

@@ -11,9 +11,18 @@ Live trading + private WebSocket::
 
     python3 bot.py --live --ws
 
+Ctrl+C stops the loop and **does not** flatten by default (positions stay on the exchange;
+next run reconciles and MR exit logic applies). To flatten everything on exit::
+
+    python3 bot.py --live --flatten-on-exit
+
 Optional public heartbeat subscription::
 
     python3 bot.py --live --ws --ws-heartbeat
+
+Verbose DEBUG (executor, REST client, WebSocket, strategies)::
+
+    python3 bot.py -v
 
 ``--ws`` uses userFills, userOrders, userPositions, userAccount (needs websocket-client).
 """
@@ -42,6 +51,27 @@ from config import (
     FUNDING_AVOID_SECS_BEFORE,
     MARKETS_CACHE_TTL_SEC,
     FUNDING_REFRESH_INTERVAL_SEC,
+    ENTRY_OPEN_PRICE_MODE,
+    MIN_HOLD_SECS,
+    MR_EXIT_MIN_PNL_PCT,
+    MR_FORCE_EXIT_Z,
+    ENABLE_MEAN_REVERSION_ENTRY,
+    ENABLE_MEAN_REVERSION_EXIT,
+    FUNDING_EXIT_SECS_BEFORE,
+    MOM_EXIT_MIN_STRENGTH,
+    FUNDING_BLOCK_IF_MOMENTUM_OPPOSES,
+    FUNDING_MOMENTUM_OPPOSE_BLOCK_STRENGTH,
+    ENABLE_MARKET_MAKING,
+    MARKET_MAKING_TICKERS,
+    MM_MAX_SPREAD_CENTS,
+    MM_QUOTE_QTY,
+    MM_MAX_INVENTORY,
+    MM_REFRESH_SECS,
+    ENABLE_UNWIND_WORKER,
+    UNWIND_TICKERS,
+    UNWIND_MAX_QTY_PER_ORDER,
+    UNWIND_REFRESH_SECS,
+    UNWIND_PRICE_MODE,
     API_KEY,
     API_SECRET,
 )
@@ -49,20 +79,40 @@ from core.client import ForumClient
 from core.market_enrichment import enrich_market_with_funding, seconds_until_iso
 from core.portfolio import Portfolio
 from strategies.signals import (
-    FundingHarvest, MeanReversion, IndexMomentum, combine_signals,
+    FundingHarvest, MeanReversion, IndexMomentum, combine_signals, WEIGHTS,
 )
 from execution.executor import Executor
 
 # ─── Logging ─────────────────────────────────────────────────────────────────
-logging.basicConfig(
-    level   = logging.INFO,
-    format  = "%(asctime)s  %(levelname)-8s  %(name)s  %(message)s",
-    handlers = [
-        logging.StreamHandler(sys.stdout),
-        logging.FileHandler("forum_bot.log"),
-    ],
-)
 log = logging.getLogger("bot")
+
+
+def setup_logging(*, verbose: bool = False) -> None:
+    root = logging.getLogger()
+    root.handlers.clear()
+    level = logging.DEBUG if verbose else logging.INFO
+    fmt = "%(asctime)s  %(levelname)-8s  %(name)s  %(message)s"
+    h_out = logging.StreamHandler(sys.stdout)
+    h_out.setLevel(level)
+    h_out.setFormatter(logging.Formatter(fmt))
+    h_file = logging.FileHandler("forum_bot.log")
+    h_file.setLevel(level)
+    h_file.setFormatter(logging.Formatter(fmt))
+    root.addHandler(h_out)
+    root.addHandler(h_file)
+    root.setLevel(level)
+    if verbose:
+        for name in (
+            "execution.executor",
+            "core.client",
+            "core.ws_client",
+            "strategies.signals",
+        ):
+            logging.getLogger(name).setLevel(logging.DEBUG)
+        log.debug("Verbose logging enabled for executor, client, ws_client, strategies.signals")
+
+
+setup_logging(verbose=False)
 
 
 # ─── Bot ─────────────────────────────────────────────────────────────────────
@@ -74,18 +124,23 @@ class ForumBot:
         dry_run: bool = True,
         use_ws: bool = False,
         ws_heartbeat: bool = False,
+        *,
+        flatten_on_exit: bool = False,
     ):
         self.client    = ForumClient(sync_time=True)
         self.portfolio = Portfolio()
         self.executor  = Executor(self.client, self.portfolio, dry_run=dry_run)
 
         self.funding_strat   = FundingHarvest()
-        self.mr_strat        = MeanReversion()
+        # Instantiate MR strategy only when enabled for entry/exit. This prevents
+        # MR state from accumulating silently and makes logs match expectations.
+        self.mr_strat        = MeanReversion() if (ENABLE_MEAN_REVERSION_ENTRY or ENABLE_MEAN_REVERSION_EXIT) else None
         self.mom_strat       = IndexMomentum()
 
         self.dry_run = dry_run
         self.use_ws = use_ws
         self.ws_heartbeat = ws_heartbeat
+        self.flatten_on_exit = flatten_on_exit
         self._ws = None
         self._last_account_status = None
         self._markets_cache_list: list | None = None
@@ -95,27 +150,78 @@ class ForumBot:
         self._funding_refresh_mono: float = 0.0
         self._extra_poll_sleep_sec: float = 0.0
         log.info(
-            "ForumBot started | dry_run=%s | ws=%s | ws_heartbeat=%s | universe=%s",
+            "ForumBot started | dry_run=%s | ws=%s | ws_heartbeat=%s | "
+            "flatten_on_exit=%s | universe=%s",
             dry_run,
             use_ws,
             ws_heartbeat,
+            flatten_on_exit,
             len(UNIVERSE),
+        )
+        log.info(
+            "config | MR_entry=%s MR_exit=%s | funding_block_if_mom_opposes=%s (thr=%.2f) | "
+            "funding_exit_secs_before=%s mom_exit_min_strength=%.2f | weights=%s | "
+            "mm=%s tickers=%s max_spread=%s qty=%s inv=%s refresh=%ss",
+            ENABLE_MEAN_REVERSION_ENTRY,
+            ENABLE_MEAN_REVERSION_EXIT,
+            FUNDING_BLOCK_IF_MOMENTUM_OPPOSES,
+            float(FUNDING_MOMENTUM_OPPOSE_BLOCK_STRENGTH),
+            FUNDING_EXIT_SECS_BEFORE,
+            float(MOM_EXIT_MIN_STRENGTH),
+            WEIGHTS,
+            ENABLE_MARKET_MAKING,
+            MARKET_MAKING_TICKERS,
+            MM_MAX_SPREAD_CENTS,
+            MM_QUOTE_QTY,
+            MM_MAX_INVENTORY,
+            MM_REFRESH_SECS,
         )
 
     def _dispatch_ws(self, msg: dict) -> None:
         ch = msg.get("channel")
         t = msg.get("type")
         if ch == "userFills" and t == "fill":
-            self.executor.ingest_exchange_fill_payload(msg.get("data") or {})
+            d = msg.get("data") or {}
+            log.info(
+                "WS fill event | ticker=%s side=%s qty=%s tradeId=%s",
+                d.get("ticker"),
+                d.get("side"),
+                d.get("qty"),
+                d.get("tradeId"),
+            )
+            self.executor.ingest_exchange_fill_payload(d)
         elif ch == "userOrders" and t == "orderUpdate":
             d = msg.get("data") or {}
             oid, st = d.get("id"), d.get("status")
+            if st in ("filled", "cancelled", "rejected"):
+                log.info(
+                    "WS orderUpdate | id=%s ticker=%s status=%s",
+                    oid,
+                    d.get("ticker"),
+                    st,
+                )
+            else:
+                log.debug(
+                    "WS orderUpdate | id=%s ticker=%s status=%s remaining=%s",
+                    oid,
+                    d.get("ticker"),
+                    st,
+                    d.get("remainingQuantity"),
+                )
             if oid is not None and st:
                 self.executor.release_pending_order_from_ws(int(oid), str(st))
         elif ch == "userPositions" and t == "positionUpdate":
-            log.debug("WS positionUpdate ticker=%s", (msg.get("data") or {}).get("ticker"))
+            d = msg.get("data") or {}
+            log.info(
+                "WS positionUpdate | ticker=%s qty=%s prevQty=%s",
+                d.get("ticker"),
+                d.get("qty"),
+                d.get("prevQty"),
+            )
         elif ch == "userAccount" and t == "accountUpdate":
             self._on_account_update_ws(msg.get("data") or {})
+        elif t == "heartbeat" or msg.get("event") in ("authOk", "subscribed", "error"):
+            log.debug("WS ctl %s", msg)
 
     def _start_ws(self) -> None:
         if self.dry_run:
@@ -195,7 +301,14 @@ class ForumBot:
                 log.info("Shutdown requested.")
                 if self._ws:
                     self._ws.stop()
-                self._emergency_close()
+                if self.flatten_on_exit:
+                    self._emergency_close()
+                elif not self.dry_run and self.portfolio.positions:
+                    log.info(
+                        "Stopping without flatten — %d position(s) remain on the exchange; "
+                        "restart the bot or use --flatten-on-exit next time to close on exit.",
+                        len(self.portfolio.positions),
+                    )
                 break
             except Exception as e:
                 log.error(f"Loop error: {e}", exc_info=True)
@@ -225,13 +338,39 @@ class ForumBot:
 
         markets = self._fetch_markets()
         if not markets:
-            log.warning("No market data received.")
+            reason = []
+            if self._last_markets_429:
+                reason.append("rate_limited(429)")
+            if not self._markets_cache_list:
+                reason.append("no_cache_yet")
+            log.warning(
+                "No market data — skip trading tick (%s)",
+                ", ".join(reason) if reason else "empty_universe_or_all_offline",
+            )
             if self._last_markets_429:
                 self._extra_poll_sleep_sec = max(self._extra_poll_sleep_sec, 45.0)
             return
 
         marks = {m["ticker"]: m["lastPrice"]
                  for m in markets if m.get("lastPrice")}
+
+        if not self.dry_run:
+            ok = self.executor.reconcile_from_exchange(marks)
+            if not ok:
+                log.warning("Skip trading tick: exchange reconcile failed")
+                return
+
+        # Reduce-only unwind worker: clean up manual/discretionary inventory without crossing.
+        if ENABLE_UNWIND_WORKER and UNWIND_TICKERS:
+            for t in list(UNWIND_TICKERS):
+                if t in self.portfolio.positions:
+                    self.executor.work_unwind_position(
+                        t,
+                        marks,
+                        max_qty_per_order=int(UNWIND_MAX_QTY_PER_ORDER),
+                        refresh_secs=int(UNWIND_REFRESH_SECS),
+                        price_mode=str(UNWIND_PRICE_MODE),
+                    )
 
         if not self.portfolio.check_risk(marks):
             log.critical("Risk limits hit – bot halted.")
@@ -243,48 +382,203 @@ class ForumBot:
             cum_funding = m.get("cumFunding", 0)
             self.portfolio.update_funding(ticker, cum_funding)
 
+        signals_fired = 0
+        execute_signal_calls = 0
+        orders_placed = 0
+        # When unwind is active and any unwind ticker is non-flat, do not open new risk.
+        unwind_active = bool(
+            ENABLE_UNWIND_WORKER
+            and UNWIND_TICKERS
+            and any((t in self.portfolio.positions and self.portfolio.positions[t].qty != 0) for t in UNWIND_TICKERS)
+        )
         for m in markets:
             ticker = m["ticker"]
             signals = []
 
+            # Funding-settlement hygiene: close any open exposure shortly before settlement.
+            pos = self.portfolio.positions.get(ticker)
+            if pos:
+                until = seconds_until_iso(m.get("nextFundingTime"))
+                if until is not None and 0 < until <= FUNDING_EXIT_SECS_BEFORE:
+                    log.info("%s: funding window exit (nextFunding in %.0fs)", ticker, until)
+                    self.executor.close_position(ticker, marks)
+                    continue
+
+                # Momentum flip exit: if index momentum strongly reverses vs our position, close.
+                mom_exit = self.mom_strat.generate(m)
+                if mom_exit and mom_exit.strength >= MOM_EXIT_MIN_STRENGTH:
+                    if (pos.qty > 0 and mom_exit.direction < 0) or (pos.qty < 0 and mom_exit.direction > 0):
+                        log.info(
+                            "%s: momentum flip exit (pos=%s mom_dir=%s strength=%.2f)",
+                            ticker,
+                            pos.qty,
+                            mom_exit.direction,
+                            mom_exit.strength,
+                        )
+                        self.executor.close_position(ticker, marks)
+                        continue
+
             fs = self.funding_strat.generate(m)
             if fs:
-                signals.append(fs)
+                if FUNDING_BLOCK_IF_MOMENTUM_OPPOSES:
+                    mom_now = self.mom_strat.generate(m)
+                    if (
+                        mom_now
+                        and mom_now.strength >= FUNDING_MOMENTUM_OPPOSE_BLOCK_STRENGTH
+                        and mom_now.direction == -fs.direction
+                    ):
+                        log.info(
+                            "%s: skip funding entry — momentum opposes (fund_dir=%s mom_dir=%s strength=%.2f)",
+                            ticker,
+                            fs.direction,
+                            mom_now.direction,
+                            mom_now.strength,
+                        )
+                    else:
+                        signals.append(fs)
+                        if mom_now:
+                            signals.append(mom_now)
+                else:
+                    signals.append(fs)
 
-            mrs = self.mr_strat.generate(m)
-            if mrs:
-                signals.append(mrs)
+            if ENABLE_MEAN_REVERSION_ENTRY:
+                if self.mr_strat is not None:
+                    mrs = self.mr_strat.generate(m)
+                    if mrs:
+                        signals.append(mrs)
 
             moms = self.mom_strat.generate(m)
             if moms:
                 signals.append(moms)
 
             pos = self.portfolio.positions.get(ticker)
-            if pos and self.mr_strat.should_exit(ticker):
-                log.info(f"MR exit: {ticker}")
+            if pos and ENABLE_MEAN_REVERSION_EXIT and self.mr_strat is not None and self._should_exit_position(ticker, marks):
+                log.info("MR exit: %s", ticker)
                 self.executor.close_position(ticker, marks)
                 continue
 
             combined = combine_signals(signals)
             if combined:
+                signals_fired += 1
+                if unwind_active:
+                    log.info("%s: skip open — unwind lockout active (cleaning inventory)", ticker)
+                    continue
                 if self._skip_funding_open(ticker, m, signals, combined):
-                    log.debug(f"{ticker}: skip funding entry (near settlement window)")
+                    log.info(
+                        "%s: combined signal skipped — funding open blocked (near nextFundingTime)",
+                        ticker,
+                    )
                     continue
                 log.info(combined)
-                urgent = combined.strategy.startswith("Combined") and \
-                         any(s.strategy == "FundingHarvest" for s in signals)
-                self.executor.execute_signal(
-                    ticker, combined.direction, combined.strength, marks,
-                    urgent=urgent,
+                funding_urgent = combined.strategy.startswith("Combined") and any(
+                    s.strategy == "FundingHarvest" for s in signals
                 )
+                price_mode = "aggressive" if funding_urgent else ENTRY_OPEN_PRICE_MODE
+                ok = self.executor.execute_signal(
+                    ticker, combined.direction, combined.strength, marks,
+                    price_mode=price_mode,
+                    strategy_label=combined.strategy,
+                )
+                execute_signal_calls += 1
+                if ok:
+                    orders_placed += 1
+            else:
+                # If directional signals are quiet (common when funding is small), run a
+                # conservative market-making loop on selected, tighter-spread tickers.
+                if ENABLE_MARKET_MAKING and ticker in set(MARKET_MAKING_TICKERS):
+                    # When you have a manual/discretionary position on the book (e.g. ALTMAN),
+                    # margin headroom is the binding constraint. In that regime, quote only the
+                    # first configured MM ticker to avoid margin conflicts + one-sided exposure.
+                    if self.portfolio.positions:
+                        # Always allow quoting tickers where we already have inventory so we can
+                        # work back toward flat (reduce-only is enforced inside the executor).
+                        have_inv = (ticker in self.portfolio.positions and self.portfolio.positions[ticker].qty != 0)
+                        if not have_inv and ticker != (MARKET_MAKING_TICKERS[0] if MARKET_MAKING_TICKERS else ticker):
+                            continue
+                    self.executor.quote_market_make(
+                        ticker,
+                        marks,
+                        qty=int(MM_QUOTE_QTY),
+                        max_spread_cents=int(MM_MAX_SPREAD_CENTS),
+                        max_inventory=int(MM_MAX_INVENTORY),
+                        refresh_secs=int(MM_REFRESH_SECS),
+                    )
 
+        self.executor.record_mark_to_market_scores(marks)
         self.executor.cancel_stale_orders()
         self.executor.sync_fills()
 
         nav = self.portfolio.nav(marks)
-        log.info(f"NAV=${nav/100:,.2f}  "
-                 f"positions={len(self.portfolio.positions)}  "
-                 f"gross_exp=${self.portfolio.gross_exposure(marks)/100:,.0f}")
+        rem = getattr(self.client, "_rate_limit_remaining", None)
+        lim = getattr(self.client, "_rate_limit_limit", None)
+        rate_s = f"{rem}/{lim}" if rem is not None else "n/a"
+        if self.portfolio.positions:
+            pos_detail = ",".join(
+                f"{t}:{p.qty}" for t, p in sorted(self.portfolio.positions.items())
+            )
+        elif self.executor.pending_bot_managed_count:
+            # Limits on the book are not positions; long = qty>0, short = qty<0 after a fill.
+            pos_detail = (
+                f"flat ({self.executor.pending_bot_managed_count} bot limits resting — "
+                "no long/short until a fill)"
+            )
+        else:
+            pos_detail = "flat"
+        log.info(
+            "NAV=$%.2f | pos=%d (%s) | gross=$%.0f | pending=%d (bot=%d manual=%d) | "
+            "tickers_live=%d | signals=%d | execute_signal_calls=%d | orders_placed=%d | api_remaining≈%s",
+            nav / 100.0,
+            len(self.portfolio.positions),
+            pos_detail,
+            self.portfolio.gross_exposure(marks) / 100.0,
+            self.executor.pending_order_count,
+            self.executor.pending_bot_managed_count,
+            self.executor.pending_manual_count,
+            len(markets),
+            signals_fired,
+            execute_signal_calls,
+            orders_placed,
+            rate_s,
+        )
+        snap = self.executor.strategy_perf_snapshot()
+        if snap:
+            parts = []
+            for strat, s in sorted(
+                snap.items(), key=lambda kv: kv[1]["avg_pnl_pct"], reverse=True
+            ):
+                parts.append(
+                    f"{strat}:avg={s['avg_pnl_pct']*100:+.2f}% n={int(s['n'])} x{s['multiplier']:.2f}"
+                )
+            log.info("strategy_throttle | %s", " | ".join(parts))
+
+    def _should_exit_position(self, ticker: str, marks: dict[str, float]) -> bool:
+        """
+        PnL-aware MR exit:
+          1) require minimum hold time,
+          2) allow standard MR exit when not materially losing,
+          3) if losing, wait for stronger reversion (very low |z|) before exit.
+        """
+        if self.executor.held_for_seconds(ticker) < MIN_HOLD_SECS:
+            return False
+        if self.mr_strat is None:
+            return False
+        if not self.mr_strat.should_exit(ticker):
+            return False
+        pnl_pct = self.executor.position_unrealized_pct(ticker, marks)
+        if pnl_pct is None or pnl_pct >= MR_EXIT_MIN_PNL_PCT:
+            return True
+        z_now = self.mr_strat.current_abs_zscore(ticker)
+        if z_now is not None and z_now <= MR_FORCE_EXIT_Z:
+            return True
+        log.info(
+            "%s: defer MR exit (pnl=%.2f%% < %.2f%%, |z|=%.3f > %.3f)",
+            ticker,
+            pnl_pct * 100.0,
+            MR_EXIT_MIN_PNL_PCT * 100.0,
+            z_now if z_now is not None else float("nan"),
+            MR_FORCE_EXIT_Z,
+        )
+        return False
 
     def _skip_funding_open(self, ticker: str, market: dict, signals, combined) -> bool:
         """
@@ -375,6 +669,12 @@ class ForumBot:
                 markets.append(m)
             except Exception as e:
                 log.debug("Fetch error %s: %s", ticker, e)
+        log.info(
+            "markets | tradable_in_loop=%d snapshot_rows=%d funding_bulk_refresh=%s",
+            len(markets),
+            len(all_mkts),
+            refresh_funding,
+        )
         return markets
 
     def _emergency_close(self):
@@ -399,9 +699,18 @@ if __name__ == "__main__":
                         help="Private user WS channels (use with --live)")
     parser.add_argument("--ws-heartbeat", action="store_true",
                         help="Also subscribe to public heartbeat (~1 Hz per ticker)")
+    parser.add_argument("-v", "--verbose", action="store_true",
+                        help="DEBUG logs for executor, API client, WebSocket, strategies")
+    parser.add_argument(
+        "--flatten-on-exit",
+        action="store_true",
+        help="On Ctrl+C, submit reduce-only closes for all positions (default: leave positions open)",
+    )
     args = parser.parse_args()
+    setup_logging(verbose=args.verbose)
     ForumBot(
         dry_run=not args.live,
         use_ws=args.ws,
         ws_heartbeat=args.ws_heartbeat,
+        flatten_on_exit=args.flatten_on_exit,
     ).run()

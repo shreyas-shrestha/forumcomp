@@ -420,6 +420,33 @@ class ForumClient:
         resp = self._get("/orders", params=params, auth=True)
         return _unwrap_list(resp, "data") or ([] if isinstance(resp, dict) else resp)
 
+    def list_all_open_orders(self, ticker: Optional[str] = None) -> list:
+        """
+        GET /orders with cursor pagination until exhausted (OpenAPI limit max 500).
+        """
+        acc: list = []
+        cursor: Optional[str] = None
+        while True:
+            params: dict = {"limit": 500}
+            if ticker:
+                params["ticker"] = ticker
+            if cursor:
+                params["cursor"] = cursor
+            resp = self._get("/orders", params=params, auth=True)
+            if isinstance(resp, dict):
+                chunk = resp.get("data")
+                if isinstance(chunk, list):
+                    acc.extend(chunk)
+                nxt = resp.get("nextCursor")
+                cursor = nxt if nxt else None
+                if not cursor:
+                    break
+            else:
+                if isinstance(resp, list):
+                    acc.extend(resp)
+                break
+        return acc
+
     def list_fills(
         self,
         ticker: Optional[str] = None,
