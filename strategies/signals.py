@@ -13,7 +13,8 @@ The Combiner weights them into a single position directive.
 
 from __future__ import annotations
 from dataclasses import dataclass
-from typing import List, Optional
+from typing import List, Optional, Sequence
+import math
 import numpy as np
 import logging
 
@@ -227,10 +228,43 @@ class IndexMomentum:
     def update(self, ticker: str, index_value: Optional[float]):
         if index_value is None:
             return
+        try:
+            v = float(index_value)
+        except (TypeError, ValueError):
+            return
         hist = self._index_hist.setdefault(ticker, [])
-        hist.append(index_value)
+        # Same poll often calls generate() multiple times per ticker (exit check, funding gate,
+        # signal). Do not stack duplicate index prints — it poisons EWM length and drift.
+        if hist and math.isclose(v, hist[-1], rel_tol=0.0, abs_tol=1e-9):
+            return
+        hist.append(v)
         if len(hist) > MOM_SLOW_BARS * 3:
             hist.pop(0)
+
+    def warmup_status(self, tickers: Sequence[str]) -> dict:
+        """
+        Diagnostics: how many names have enough index samples for IndexMomentum.generate().
+        Call after markets have been processed so update() has run for each ticker.
+        """
+        need = MOM_SLOW_BARS + 1
+        ready = 0
+        empty = 0
+        lengths: list[int] = []
+        for t in tickers:
+            ln = len(self._index_hist.get(t, []))
+            lengths.append(ln)
+            if ln == 0:
+                empty += 1
+            elif ln >= need:
+                ready += 1
+        return {
+            "need_bars": need,
+            "ready": ready,
+            "total": len(tickers),
+            "empty_hist": empty,
+            "min_len": min(lengths) if lengths else 0,
+            "max_len": max(lengths) if lengths else 0,
+        }
 
     def _ewm(self, values: list[float], span: int) -> float:
         alpha = 2.0 / (span + 1)
@@ -263,9 +297,9 @@ class IndexMomentum:
         direction = 1 if norm_diff > 0 else -1
         strength  = min(1.0, abs(norm_diff) / (MOM_SIGNAL_THRESH * 3))
 
-        # Edge: if we're correct, price should move by at least this fraction
-        # (conservative: assume 50% of index move translates to price move)
-        edge = abs(norm_diff) * 0.5
+        # Use full normalized divergence as edge so we clear MIN_EDGE_THRESHOLD once
+        # |norm_diff| >= MOM_SIGNAL_THRESH (0.5× was routinely filtered out by the combiner).
+        edge = abs(norm_diff)
 
         if edge < MIN_EDGE_THRESHOLD:
             return None

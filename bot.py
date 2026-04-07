@@ -29,6 +29,8 @@ Verbose DEBUG (executor, REST client, WebSocket, strategies)::
 
 from __future__ import annotations
 
+from typing import Optional
+
 import argparse
 import logging
 import sys
@@ -77,6 +79,12 @@ from config import (
     UNWIND_PRICE_MODE,
     API_KEY,
     API_SECRET,
+    MAX_ALLOC_FREE_MARGIN_FRAC,
+    MAX_DISTINCT_POSITION_TICKERS,
+    MAX_POSITION_PCT,
+    MOM_WARMUP_LOG_INTERVAL_TICKS,
+    ENABLE_MARGIN_RELEASE,
+    MARGIN_RELEASE_FREE_BELOW_CENTS,
 )
 from core.client import ForumClient
 from core.market_enrichment import enrich_market_with_funding, seconds_until_iso
@@ -157,6 +165,8 @@ class ForumBot:
         self._funding_overlay: dict[str, dict] = {}
         self._funding_refresh_mono: float = 0.0
         self._extra_poll_sleep_sec: float = 0.0
+        self._loop_tick: int = 0
+        self._last_mom_by_ticker: dict[str, Optional[Signal]] = {}
         log.info(
             "ForumBot started | dry_run=%s | ws=%s | ws_heartbeat=%s | "
             "flatten_on_exit=%s | universe=%s",
@@ -183,6 +193,19 @@ class ForumBot:
             MM_QUOTE_QTY,
             MM_MAX_INVENTORY,
             MM_REFRESH_SECS,
+        )
+        log.info(
+            "sizing | MAX_ALLOC_FREE_MARGIN_FRAC=%.2f (logged on opens as alloc=%%) | "
+            "MAX_POSITION_PCT=%.2f | MAX_DISTINCT_POSITION_TICKERS=%s | MAX_NEW_OPENS_PER_LOOP=%d",
+            float(MAX_ALLOC_FREE_MARGIN_FRAC),
+            float(MAX_POSITION_PCT),
+            MAX_DISTINCT_POSITION_TICKERS if MAX_DISTINCT_POSITION_TICKERS > 0 else "off",
+            int(MAX_NEW_OPENS_PER_LOOP),
+        )
+        log.info(
+            "margin_release | enabled=%s | free_below=$%.2f",
+            ENABLE_MARGIN_RELEASE,
+            float(MARGIN_RELEASE_FREE_BELOW_CENTS) / 100.0,
         )
 
     def _dispatch_ws(self, msg: dict) -> None:
@@ -385,6 +408,9 @@ class ForumBot:
             self._emergency_close()
             return
 
+        if not self.dry_run:
+            self.executor.maybe_optimal_margin_release(markets, marks)
+
         for m in markets:
             ticker = m["ticker"]
             cum_funding = m.get("cumFunding", 0)
@@ -404,6 +430,7 @@ class ForumBot:
         first_mm = MARKET_MAKING_TICKERS[0] if MARKET_MAKING_TICKERS else None
         open_candidates: list[tuple[float, str, dict, list[Signal], Signal]] = []
 
+        self._last_mom_by_ticker.clear()
         for m in markets:
             ticker = m["ticker"]
             signals = []
@@ -463,6 +490,7 @@ class ForumBot:
             moms = self.mom_strat.generate(m)
             if moms:
                 signals.append(moms)
+            self._last_mom_by_ticker[ticker] = moms
 
             pos = self.portfolio.positions.get(ticker)
             if pos and ENABLE_MEAN_REVERSION_EXIT and self.mr_strat is not None and self._should_exit_position(ticker, marks):
@@ -550,6 +578,52 @@ class ForumBot:
             if ok:
                 orders_placed += 1
                 opens_budget -= 1
+
+        self._loop_tick += 1
+        interval = int(MOM_WARMUP_LOG_INTERVAL_TICKS)
+        if interval > 0 and self._loop_tick % interval == 0:
+            st = self.mom_strat.warmup_status(UNIVERSE)
+            log.info(
+                "IndexMomentum warmup | ready=%d/%d with ≥%d index samples "
+                "(hist min=%d max=%d; empty=%d). If ready=0, lastIndexValue may be missing from markets.",
+                st["ready"],
+                st["total"],
+                st["need_bars"],
+                st["min_len"],
+                st["max_len"],
+                st["empty_hist"],
+            )
+            held_mom = 0
+            held_align = 0
+            for t, pos in self.portfolio.positions.items():
+                if pos.qty == 0:
+                    continue
+                ms = self._last_mom_by_ticker.get(t)
+                if ms is None or ms.direction == 0:
+                    continue
+                held_mom += 1
+                if (pos.qty > 0 and ms.direction > 0) or (pos.qty < 0 and ms.direction < 0):
+                    held_align += 1
+            bk = self.executor.momentum_attribution_buckets()
+            perf_parts: list[str] = []
+            for label, key in (
+                ("combined_incl_mom", "with_momentum"),
+                ("funding_only", "funding_only"),
+            ):
+                row = bk.get(key)
+                if row:
+                    perf_parts.append(
+                        f"{label}:n={int(row['n'])} avg_mtm={row['avg_pnl_pct'] * 100:+.3f}%"
+                    )
+            pct = (100.0 * held_align / held_mom) if held_mom else 0.0
+            log.info(
+                "momentum_diagnostic | book vs live mom: %d/%d held tickers align (%.0f%%) "
+                "(of those with a non-flat mom signal this poll) | score_hist %s",
+                held_align,
+                held_mom,
+                pct,
+                " | ".join(perf_parts) if perf_parts else "(empty — need open positions + throttle samples)",
+            )
 
         self.executor.record_mark_to_market_scores(marks)
         self.executor.cancel_stale_orders()

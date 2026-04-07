@@ -41,6 +41,12 @@ from config import (
     UNWIND_MIN_PROFIT_CENTS,
     UNWIND_FORCE_IF_FREE_MARGIN_BELOW_CENTS,
     MAX_ALLOC_FREE_MARGIN_FRAC,
+    MAX_DISTINCT_POSITION_TICKERS,
+    ENABLE_MARGIN_RELEASE,
+    MARGIN_RELEASE_FREE_BELOW_CENTS,
+    MARGIN_RELEASE_COOLDOWN_SECS,
+    MARGIN_RELEASE_MAX_PER_LOOP,
+    MARGIN_RELEASE_LEAVE_MIN_POSITIONS,
 )
 
 log = logging.getLogger(__name__)
@@ -92,6 +98,7 @@ class Executor:
         # Consecutive unwind refreshes per ticker since last flatten.
         # Used to escalate pricing when reduce-only limits never fill.
         self._unwind_refresh_count: dict[str, int] = {}
+        self._margin_release_cooldown_until: float = 0.0
 
     @property
     def pending_order_count(self) -> int:
@@ -245,6 +252,19 @@ class Executor:
             log.info("%s: skip open — margin cooldown active (%.0fs left)", ticker, self._margin_cooldown_until - time.time())
             return False
 
+        if (
+            MAX_DISTINCT_POSITION_TICKERS > 0
+            and ticker not in self.portfolio.positions
+            and len(self.portfolio.positions) >= MAX_DISTINCT_POSITION_TICKERS
+        ):
+            log.info(
+                "%s: skip open — max distinct position tickers (%d/%d)",
+                ticker,
+                len(self.portfolio.positions),
+                MAX_DISTINCT_POSITION_TICKERS,
+            )
+            return False
+
         side = "buy" if direction > 0 else "sell"
         eff_strength = self.apply_strategy_throttle(strategy_label, strength)
         qty  = self.portfolio.target_qty(ticker, side, marks, fraction=eff_strength)
@@ -254,10 +274,9 @@ class Executor:
 
         if qty <= 0:
             log.info(
-                "%s: skip order — target qty=0 (side=%s strength=%.2f; check NAV vs per-ticker cap)",
+                "%s: skip order — target qty=0 (%s)",
                 ticker,
-                side,
-                eff_strength,
+                self.portfolio.explain_zero_target_qty(ticker, marks, eff_strength),
             )
             return False
 
@@ -356,8 +375,8 @@ class Executor:
         self._cancel_bot_managed_orders_for_ticker(ticker)
         return self._place(ticker, side, qty, price, price_mode=mode, strategy_label=strategy_label)
 
-    def close_position(self, ticker: str, marks: dict[str, float]):
-        self._close_position(ticker, marks)
+    def close_position(self, ticker: str, marks: dict[str, float], *, strategy_label: Optional[str] = None):
+        self._close_position(ticker, marks, strategy_label=strategy_label)
 
     def quote_market_make(
         self,
@@ -696,9 +715,98 @@ class Executor:
             return None
         return pnl_cents / denom
 
+    def maybe_optimal_margin_release(
+        self,
+        markets: list[dict],
+        marks: dict[str, float],
+    ) -> None:
+        """
+        If free margin is below MARGIN_RELEASE_FREE_BELOW_CENTS, close up to
+        MARGIN_RELEASE_MAX_PER_LOOP full position(s) ranked by:
+          1) worst funding (paying vs receiving) — Forum sign: long earns when rate < 0
+          2) worst mark-to-market PnL %
+          3) largest notional — frees the most headroom when ties remain
+        """
+        if self.dry_run or not ENABLE_MARGIN_RELEASE:
+            return
+        fm = self._last_free_margin_cents
+        if fm is None or fm >= float(MARGIN_RELEASE_FREE_BELOW_CENTS):
+            return
+        now = time.time()
+        if now < self._margin_release_cooldown_until:
+            return
+        npos = len(self.portfolio.positions)
+        leave = int(MARGIN_RELEASE_LEAVE_MIN_POSITIONS)
+        if npos <= leave:
+            return
+
+        by_t = {m["ticker"]: m for m in markets if m.get("ticker")}
+        ranked: list[tuple[tuple[float, float, float], str, float, float]] = []
+        for t, pos in self.portfolio.positions.items():
+            if pos.qty == 0:
+                continue
+            mark = marks.get(t)
+            if mark is None:
+                continue
+            notional = abs(float(pos.qty)) * float(mark)
+            if notional <= 0:
+                continue
+            mkt = by_t.get(t) or {}
+            try:
+                rate = float(mkt.get("movingFundingRate") or 0.0)
+            except (TypeError, ValueError):
+                rate = 0.0
+            q = pos.qty
+            # Positive fcarry ≈ earning funding on this side; negative ≈ paying.
+            if q > 0:
+                fcarry = -rate
+            else:
+                fcarry = rate
+            up = self.position_unrealized_pct(t, marks)
+            upv = float(up) if up is not None else 0.0
+            # Sort ascending: payers first (lowest fcarry), then worst PnL, then bigger notionals.
+            key = (fcarry, upv, -notional)
+            ranked.append((key, t, fcarry, notional))
+
+        if not ranked:
+            return
+        ranked.sort(key=lambda x: x[0])
+        max_closes = min(
+            max(1, int(MARGIN_RELEASE_MAX_PER_LOOP)),
+            npos - leave,
+            len(ranked),
+        )
+        if max_closes <= 0:
+            return
+
+        for i in range(max_closes):
+            _key, ticker, fcarry, notional = ranked[i]
+            log.info(
+                "margin release | free≈$%.2f — closing %s (fcarry≈%.5f mtm=%+.2f%% notional≈$%.0f) [%d/%d]",
+                fm / 100.0,
+                ticker,
+                fcarry,
+                _key[1] * 100.0,
+                notional / 100.0,
+                i + 1,
+                max_closes,
+            )
+            ok = self._close_position(ticker, marks, strategy_label="MarginRelease")
+            if ok:
+                break
+            log.warning("%s: margin release close failed — trying next candidate", ticker)
+
+        self._margin_release_cooldown_until = now + float(MARGIN_RELEASE_COOLDOWN_SECS)
+
     # ── Internals ────────────────────────────────────────────────────────────
 
-    def _close_position(self, ticker: str, marks: dict[str, float]) -> bool:
+    def _close_position(
+        self,
+        ticker: str,
+        marks: dict[str, float],
+        *,
+        strategy_label: Optional[str] = None,
+    ) -> bool:
         pos = self.portfolio.positions.get(ticker)
         if not pos or pos.qty == 0:
             return False
@@ -707,7 +815,11 @@ class Executor:
         price = self._get_order_price(ticker, side, marks, "aggressive")
         if price:
             self._cancel_bot_managed_orders_for_ticker(ticker)
-            open_strategy = self._ticker_last_open_strategy.get(ticker)
+            open_strategy = (
+                strategy_label
+                if strategy_label is not None
+                else self._ticker_last_open_strategy.get(ticker)
+            )
             ok = self._place(
                 ticker,
                 side,
@@ -1005,6 +1117,40 @@ class Executor:
                 "multiplier": self.strategy_multiplier(strat),
             }
         return out
+
+    def momentum_attribution_buckets(self) -> dict[str, Optional[dict[str, float]]]:
+        """
+        Merge mark-to-market / realized score streams by whether the opening label
+        included IndexMomentum. Lets you compare 'was momentum in the room?' vs
+        funding-only Combined(...) without changing per-order labels.
+        """
+        with_mom: list[float] = []
+        funding_only: list[float] = []
+        other: list[float] = []
+        for label, hist in self._strategy_score_hist.items():
+            if not hist:
+                continue
+            vals = list(hist)
+            if "IndexMomentum" in label:
+                with_mom.extend(vals)
+            elif "FundingHarvest" in label:
+                funding_only.extend(vals)
+            else:
+                other.extend(vals)
+
+        def _pack(vals: list[float]) -> Optional[dict[str, float]]:
+            if not vals:
+                return None
+            return {
+                "n": float(len(vals)),
+                "avg_pnl_pct": float(sum(vals) / len(vals)),
+            }
+
+        return {
+            "with_momentum": _pack(with_mom),
+            "funding_only": _pack(funding_only),
+            "other": _pack(other),
+        }
 
     # ── Stale order cleanup ──────────────────────────────────────────────────
 

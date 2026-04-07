@@ -50,8 +50,13 @@ UNIVERSE = [
 # ─── CAPITAL ──────────────────────────────────────────────────────────────────
 # 100_000 cents = $1,000 (typical comp notional). Portfolio NAV is local until fills sync.
 INITIAL_CAPITAL     = 100_000
-MAX_POSITION_PCT    = 0.14          # per-ticker cap (full 20-name universe; avoids margin pile-up)
+# Per-ticker notional cap (fraction of NAV). 0.14 × ~$1000 ≈ $140/ticker — often < 1 contract
+# when price is $50+ and the name already has inventory; 0.16–0.18 is a practical comp default.
+MAX_POSITION_PCT    = 0.16
 MAX_GROSS_LEVERAGE  = 2.0           # total resting + positions cap in notional terms
+# Block opening a **new** ticker (flat name) when already holding this many distinct symbols.
+# 0 = disabled. Stops “13 micro-positions” from eating all per-name budget + margin.
+MAX_DISTINCT_POSITION_TICKERS = 10
 MIN_EDGE_THRESHOLD  = 0.0040        # combiner min avg edge — MR edge is coarse; higher = fewer spurious trades
 # Combined-signal quality gates: push toward fewer, higher-conviction trades.
 MIN_COMBINED_STRENGTH = 0.22
@@ -109,6 +114,20 @@ MAX_PENDING_BOT_ORDERS = 8
 MAX_PENDING_BOT_ORDERS_PER_TICKER = 2
 # On margin errors, pause new opens briefly (still allows reduce-only closes).
 MARGIN_ERROR_COOLDOWN_SECS = 180
+
+# ─── AUTOMATIC MARGIN RELEASE ────────────────────────────────────────────────
+# When free margin is tight, fully close one position per loop (aggressive reduce-only),
+# chosen to sacrifice the least valuable book: funding payers first, then worst MTM PnL,
+# then larger notionals to free the most headroom. Set ENABLE_MARGIN_RELEASE = False to disable.
+ENABLE_MARGIN_RELEASE = True
+# Act when exchange freeMargin (cents) is below this (e.g. 18_000 = $180).
+MARGIN_RELEASE_FREE_BELOW_CENTS = 18_000
+# After a release, wait this long before another (avoids close spam).
+MARGIN_RELEASE_COOLDOWN_SECS = 90
+# At most this many full closes per main loop (keep at 1 unless you accept burst risk).
+MARGIN_RELEASE_MAX_PER_LOOP = 1
+# Do not run if position count is at or below this (e.g. 1 = keep at least one name always).
+MARGIN_RELEASE_LEAVE_MIN_POSITIONS = 0
 
 # ─── MARKET MAKING (SPREAD CAPTURE) ───────────────────────────────────────────
 # Thin books mean spreads dominate signal edges. This mode places small two-sided quotes
@@ -177,7 +196,10 @@ FUNDING_AGGRESSIVE_ENTRY_SECS_BEFORE = 120
 # ─── MOMENTUM ─────────────────────────────────────────────────────────────────
 MOM_FAST_BARS       = 6             # fast EWM (3h)
 MOM_SLOW_BARS       = 24            # slow EWM (12h)
-MOM_SIGNAL_THRESH   = 0.005         # min fast-slow divergence to trade
+# Normalized fast–slow index divergence; lower → more IndexMomentum signals (and more noise).
+MOM_SIGNAL_THRESH   = 0.0045
+# Log IndexMomentum history readiness every N main-loop iterations (0 = never).
+MOM_WARMUP_LOG_INTERVAL_TICKS = 30
 
 # ─── EXECUTION ────────────────────────────────────────────────────────────────
 POLL_INTERVAL_SECS  = 60            # main loop frequency

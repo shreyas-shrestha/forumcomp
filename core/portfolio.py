@@ -95,6 +95,42 @@ class Portfolio:
         qty = int(max_notional / price)
         return qty  # caller applies sign
 
+    def explain_zero_target_qty(
+        self, ticker: str, marks: Dict[str, float], fraction: float
+    ) -> str:
+        """
+        Human-readable reason when target_qty(...) == 0 (per-ticker cap, gross cap, or <1 contract).
+        """
+        price = marks.get(ticker)
+        if not price:
+            return "no mark price for sizing"
+        nav = self.nav(marks)
+        per_name_cap = nav * MAX_POSITION_PCT
+        pos = self.positions.get(ticker)
+        q = pos.qty if pos else 0
+        cur_notional = abs(q) * float(marks.get(ticker, 0))
+        remaining_name = per_name_cap - cur_notional
+        gross_cap = nav * MAX_GROSS_LEVERAGE
+        gex = self.gross_exposure(marks)
+        remaining_gross = gross_cap - gex
+        raw_cap = min(max(0.0, remaining_name), max(0.0, remaining_gross))
+        max_notional = raw_cap * fraction
+        if raw_cap <= 0:
+            if remaining_name <= 0:
+                return (
+                    f"per-ticker cap (NAV≈${nav / 100:.0f} × {MAX_POSITION_PCT:.0%} "
+                    f"≈${per_name_cap / 100:.0f}; {ticker} already ≈${cur_notional / 100:.0f})"
+                )
+            return (
+                f"gross cap (gross≈${gex / 100:.0f} vs max≈${gross_cap / 100:.0f})"
+            )
+        if max_notional < price:
+            return (
+                f"below 1 contract after sizing (room≈${max_notional / 100:.2f} "
+                f"vs px≈${price / 100:.2f}, strength×{fraction:.2f})"
+            )
+        return "qty rounded to 0 (unexpected — check sizing)"
+
     # ── Trade accounting ─────────────────────────────────────────────────────
 
     def record_fill(self, ticker: str, side: str, qty: int,
